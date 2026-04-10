@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1363,5 +1364,138 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error from Gather: %v", err)
 		}
+	}
+}
+
+// TestGatherPanicRecovery verifies that Gather recovers from a panicking
+// collector, surfaces the panic as an error, preserves metrics emitted before
+// the panic, and emits an InvalidMetric for the panic.
+func TestGatherPanicRecovery(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	reg := prometheus.NewRegistry()
+
+	// A well-behaved collector registered before the panicking one.
+	goodGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "good_metric",
+		Help: "A metric from a well-behaved collector.",
+	})
+	goodGauge.Set(42)
+	reg.MustRegister(goodGauge)
+
+	// A collector that emits one metric then panics.
+	prePanicGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "pre_panic_metric",
+		Help: "A metric emitted before the collector panics.",
+	})
+	prePanicGauge.Set(7)
+	panicMsg := "boom from collector"
+	reg.MustRegister(&customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			ch <- prePanicGauge
+			panic(panicMsg)
+		},
+	})
+
+	mfs, err := reg.Gather()
+
+	// An error must be returned describing the panic.
+	if err == nil {
+		t.Fatal("expected an error from Gather, got nil")
+	}
+	if !strings.Contains(err.Error(), panicMsg) {
+		t.Errorf("error %q does not contain panic message %q", err, panicMsg)
+	}
+	if !strings.Contains(err.Error(), "collector panicked") {
+		t.Errorf("error %q does not contain 'collector panicked'", err)
+	}
+
+	// Metrics from the good collector and from before the panic must be present.
+	metricNames := map[string]bool{}
+	for _, mf := range mfs {
+		metricNames[mf.GetName()] = true
+	}
+	for _, want := range []string{"good_metric", "pre_panic_metric"} {
+		if !metricNames[want] {
+			t.Errorf("expected metric %q in gathered output, got: %v", want, metricNames)
+		}
+	}
+}
+
+// TestGatherPanicRecoveryUnchecked is the same as TestGatherPanicRecovery but
+// uses an unchecked collector (Describe yields no descriptors).
+func TestGatherPanicRecoveryUnchecked(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	reg := prometheus.NewRegistry()
+
+	panicMsg := "boom from unchecked collector"
+	reg.MustRegister(uncheckedCollector{&customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			panic(panicMsg)
+		},
+	}})
+
+	_, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected an error from Gather, got nil")
+	}
+	if !strings.Contains(err.Error(), panicMsg) {
+		t.Errorf("error %q does not contain panic message %q", err, panicMsg)
+	}
+}
+
+// TestGatherPanicRecoveryStackTrace verifies that the error returned by Gather
+// after a collector panic includes a stack trace.
+func TestGatherPanicRecoveryStackTrace(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(&customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			panic("stack trace test")
+		},
+	})
+
+	_, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	// A stack trace always contains "goroutine" from runtime.Stack output.
+	if !strings.Contains(err.Error(), "goroutine") {
+		t.Errorf("error does not appear to contain a stack trace: %v", err)
+	}
+}
+
+// TestMustGatherPanicsOnError verifies that MustGather panics when Gather
+// returns an error.
+func TestMustGatherPanicsOnError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(&customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			panic("trigger gather error")
+		},
+	})
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("MustGather did not panic on error")
+		}
+	}()
+	prometheus.MustGather(reg)
+}
+
+// TestMustGatherReturnsMetrics verifies that MustGather returns metrics when
+// Gather succeeds.
+func TestMustGatherReturnsMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	g := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "must_gather_metric",
+		Help: "A metric for MustGather test.",
+	})
+	g.Set(1)
+	reg.MustRegister(g)
+
+	mfs := prometheus.MustGather(reg)
+	if len(mfs) == 0 {
+		t.Error("MustGather returned no metric families")
 	}
 }
