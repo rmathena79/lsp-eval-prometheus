@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__gopls__go_workspace",
+      "mcp__gopls__go_vulncheck",
+      "mcp__gopls__go_search",
+      "mcp__gopls__go_file_context",
+      "mcp__gopls__go_diagnostics",
+      "Bash(go test:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "gopls"
+  ]
+}

@@ -423,7 +423,8 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		uncheckedMetricChan = make(chan Metric, capMetricChan)
 		metricHashes        = map[uint64]struct{}{}
 		wg                  sync.WaitGroup
-		errs                MultiError          // The collected errors to return in the end.
+		errsMtx             sync.Mutex // Protects errs for thread-safe error accumulation
+		errs                MultiError // The collected errors to return in the end.
 		registeredDescIDs   map[uint64]struct{} // Only used for pedantic checks
 	)
 
@@ -453,9 +454,61 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		for {
 			select {
 			case collector := <-checkedCollectors:
-				collector.Collect(checkedMetricChan)
+				// Recover from collector panics
+				func() {
+					defer func() {
+						if p := recover(); p != nil {
+							// Capture stack trace
+							stackBuf := make([]byte, 64<<10) // 64KB buffer
+							stackLen := runtime.Stack(stackBuf, false)
+							stackTrace := string(stackBuf[:stackLen])
+
+							// Create error with stack trace
+							err := fmt.Errorf("collector panic: %v\nStack trace:\n%s", p, stackTrace)
+
+							// Create an InvalidMetric to report the error in the gathered output
+							invalidMetric := NewInvalidMetric(
+								NewInvalidDesc(err),
+								err,
+							)
+							checkedMetricChan <- invalidMetric
+
+							// Append error to list (thread-safe)
+							errsMtx.Lock()
+							errs.Append(err)
+							errsMtx.Unlock()
+						}
+					}()
+					collector.Collect(checkedMetricChan)
+				}()
 			case collector := <-uncheckedCollectors:
-				collector.Collect(uncheckedMetricChan)
+				// Recover from collector panics
+				func() {
+					defer func() {
+						if p := recover(); p != nil {
+							// Capture stack trace
+							stackBuf := make([]byte, 64<<10) // 64KB buffer
+							stackLen := runtime.Stack(stackBuf, false)
+							stackTrace := string(stackBuf[:stackLen])
+
+							// Create error with stack trace
+							err := fmt.Errorf("collector panic: %v\nStack trace:\n%s", p, stackTrace)
+
+							// Create an InvalidMetric to report the error in the gathered output
+							invalidMetric := NewInvalidMetric(
+								NewInvalidDesc(err),
+								err,
+							)
+							uncheckedMetricChan <- invalidMetric
+
+							// Append error to list (thread-safe)
+							errsMtx.Lock()
+							errs.Append(err)
+							errsMtx.Unlock()
+						}
+					}()
+					collector.Collect(uncheckedMetricChan)
+				}()
 			default:
 				return
 			}
@@ -499,21 +552,25 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				cmc = nil
 				break
 			}
+			errsMtx.Lock()
 			errs.Append(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				registeredDescIDs,
 			))
+			errsMtx.Unlock()
 		case metric, ok := <-umc:
 			if !ok {
 				umc = nil
 				break
 			}
+			errsMtx.Lock()
 			errs.Append(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				nil,
 			))
+			errsMtx.Unlock()
 		default:
 			if goroutineBudget <= 0 || len(checkedCollectors)+len(uncheckedCollectors) == 0 {
 				// All collectors are already being worked on or
@@ -526,21 +583,25 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						cmc = nil
 						break
 					}
+					errsMtx.Lock()
 					errs.Append(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						registeredDescIDs,
 					))
+					errsMtx.Unlock()
 				case metric, ok := <-umc:
 					if !ok {
 						umc = nil
 						break
 					}
+					errsMtx.Lock()
 					errs.Append(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						nil,
 					))
+					errsMtx.Unlock()
 				}
 				break
 			}
@@ -557,6 +618,17 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		}
 	}
 	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap()
+}
+
+// MustGather calls Gather and panics if any errors are returned. It is useful
+// in scenarios where Gather errors should cause the program to fail, such as
+// in test code or in programs where metric collection is critical.
+func (r *Registry) MustGather() []*dto.MetricFamily {
+	mfs, err := r.Gather()
+	if err != nil {
+		panic(err)
+	}
+	return mfs
 }
 
 // Describe implements Collector.

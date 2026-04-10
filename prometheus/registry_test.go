@@ -1365,3 +1365,166 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 		}
 	}
 }
+
+// panicCollector is a collector that panics during Collect.
+type panicCollector struct {
+	panicMsg string
+}
+
+func (pc *panicCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- prometheus.NewDesc("panic_metric", "A metric that panics", nil, nil)
+}
+
+func (pc *panicCollector) Collect(ch chan<- prometheus.Metric) {
+	ch <- prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "metric_before_panic",
+		Help: "This metric is emitted before the panic",
+	})
+	panic(pc.panicMsg)
+}
+
+// emittingPanicCollector is a collector that emits a metric then panics.
+type emittingPanicCollector struct{}
+
+func (epc *emittingPanicCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- prometheus.NewDesc("metric_before_panic", "Metric before panic", nil, nil)
+}
+
+func (epc *emittingPanicCollector) Collect(ch chan<- prometheus.Metric) {
+	counter := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "metric_before_panic",
+		Help: "Metric before panic",
+	}, func() float64 {
+		return 123.45
+	})
+	ch <- counter
+	panic("intentional panic")
+}
+
+// TestGatherRecoverFromCollectorPanic tests that Gather recovers from collector panics.
+func TestGatherRecoverFromCollectorPanic(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	reg := prometheus.NewRegistry()
+
+	// Register a normal collector and a panic collector
+	normalGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "normal_metric",
+		Help: "A normal metric",
+	})
+	normalGauge.Set(42)
+	reg.MustRegister(normalGauge)
+
+	panicMsg := "test panic message"
+	reg.MustRegister(&panicCollector{panicMsg: panicMsg})
+
+	// Gather should not crash despite the panic
+	mfs, err := reg.Gather()
+
+	// Should have an error
+	if err == nil {
+		t.Fatal("expected error from Gather, got nil")
+	}
+
+	// Error should mention the panic
+	if !contains(err.Error(), "collector panic") {
+		t.Errorf("expected error to mention 'collector panic', got: %v", err)
+	}
+
+	// Error should contain the panic message
+	if !contains(err.Error(), panicMsg) {
+		t.Errorf("expected error to contain panic message '%s', got: %v", panicMsg, err)
+	}
+
+	// Error should include a stack trace
+	if !contains(err.Error(), "Stack trace") {
+		t.Errorf("expected error to include stack trace, got: %v", err)
+	}
+
+	// Should have gathered some metrics (at least the normal one)
+	if len(mfs) == 0 {
+		t.Fatal("expected some metric families, got none")
+	}
+
+	// Look for the normal metric in the output
+	foundNormal := false
+	for _, mf := range mfs {
+		if mf.GetName() == "normal_metric" {
+			foundNormal = true
+			break
+		}
+	}
+
+	if !foundNormal {
+		t.Error("normal metric was not preserved in gather output")
+	}
+}
+
+// TestGatherPreservesMetricsBeforePanic tests that metrics emitted before panic are preserved.
+func TestGatherPreservesMetricsBeforePanic(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	reg := prometheus.NewRegistry()
+
+	reg.MustRegister(&emittingPanicCollector{})
+
+	mfs, err := reg.Gather()
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// The metric emitted before the panic should still be in the output
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "metric_before_panic" {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Error("metrics emitted before panic were not preserved in output")
+	}
+}
+
+// TestMustGatherPanics tests that MustGather panics when Gather returns errors.
+func TestMustGatherPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected MustGather to panic, but it didn't")
+		}
+	}()
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(&panicCollector{panicMsg: "test panic"})
+
+	// This should panic
+	reg.MustGather()
+
+	t.Fatal("should not reach here")
+}
+
+// TestMustGatherSucceeds tests that MustGather succeeds when there are no errors.
+func TestMustGatherSucceeds(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	gauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_metric",
+		Help: "Test metric",
+	})
+	gauge.Set(100)
+	reg.MustRegister(gauge)
+
+	// Should not panic
+	mfs := reg.MustGather()
+
+	if len(mfs) == 0 {
+		t.Fatal("expected metrics, got none")
+	}
+}
+
+// Helper function to check if a string contains a substring.
+func contains(s, substr string) bool {
+	return bytes.Contains([]byte(s), []byte(substr))
+}
