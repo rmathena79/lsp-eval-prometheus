@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gopls": {
+      "command": "gopls",
+      "args": ["mcp"],
+      "env": {
+        "GOPATH": "C:\\Users\\uniqu\\go",
+        "GOCACHE": "C:\\Users\\uniqu\\AppData\\Local\\go-build"
+      }
+    }
+  }
+}
