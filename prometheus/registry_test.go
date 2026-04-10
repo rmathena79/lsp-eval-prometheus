@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1364,4 +1365,176 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 			t.Fatalf("unexpected error from Gather: %v", err)
 		}
 	}
+}
+
+func TestGatherRecoversPanicInCollector(t *testing.T) {
+	// Create a new registry without default collectors.
+	reg := prometheus.NewRegistry()
+
+	// Register a collector that panics during Collect.
+	panicCollector := &customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			// Send one metric before panicking.
+			ch <- prometheus.NewMetricWithTimestamp(time.Now(), prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "test_metric_before_panic",
+				Help: "Test metric emitted before panic",
+			}))
+			// Now panic.
+			panic("simulated collector panic")
+		},
+	}
+
+	reg.MustRegister(panicCollector)
+
+	// Gather should not crash, but should return an error.
+	mfs, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected error from panicking collector, but got nil")
+	}
+
+	// The error should mention panic and stack trace.
+	errStr := err.Error()
+	if !strings.Contains(errStr, "panic") || !strings.Contains(errStr, "simulated collector panic") {
+		t.Fatalf("error message doesn't contain expected panic information: %v", err)
+	}
+
+	// Metrics emitted before panic should be preserved in output.
+	foundMetric := false
+	for _, mf := range mfs {
+		if mf.GetName() == "test_metric_before_panic" {
+			foundMetric = true
+			break
+		}
+	}
+	if !foundMetric {
+		t.Error("metrics emitted before panic were not preserved in gathered output")
+	}
+}
+
+func TestGatherPreservesMetricsBeforePanic(t *testing.T) {
+	// Create a new registry without default collectors.
+	reg := prometheus.NewRegistry()
+
+	// Register a collector that emits several metrics then panics.
+	panicCollector := &customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			for i := 0; i < 5; i++ {
+				ch <- prometheus.NewMetricWithTimestamp(time.Now(), prometheus.NewGauge(prometheus.GaugeOpts{
+					Name: fmt.Sprintf("test_metric_%d", i),
+					Help: "Test metric",
+				}))
+			}
+			panic("test panic after metrics")
+		},
+	}
+
+	reg.MustRegister(panicCollector)
+
+	// Gather should preserve all metrics emitted before panic.
+	mfs, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected error from panicking collector")
+	}
+
+	// Count the metrics we expected to collect before panic.
+	metricCount := 0
+	for _, mf := range mfs {
+		for i := 0; i < 5; i++ {
+			if mf.GetName() == fmt.Sprintf("test_metric_%d", i) {
+				metricCount++
+			}
+		}
+	}
+
+	if metricCount != 5 {
+		t.Errorf("expected 5 metrics emitted before panic, but got %d", metricCount)
+	}
+}
+
+func TestGatherMultiplePanickingCollectors(t *testing.T) {
+	// Create a new registry without default collectors.
+	reg := prometheus.NewRegistry()
+
+	// Register multiple collectors that panic.
+	for i := 0; i < 3; i++ {
+		idx := i // Capture for closure.
+		collector := &customCollector{
+			collectFunc: func(ch chan<- prometheus.Metric) {
+				panic(fmt.Sprintf("panic from collector %d", idx))
+			},
+		}
+		reg.MustRegister(collector)
+	}
+
+	// Gather should handle all panics and return errors for all of them.
+	_, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected error from panicking collectors")
+	}
+
+	// The error should be a MultiError with at least 3 errors.
+	errStr := err.Error()
+	if !strings.Contains(errStr, "error(s) occurred") {
+		t.Fatalf("expected MultiError format, got: %v", err)
+	}
+
+	// Check that we have error entries for each panicking collector.
+	panicCount := 0
+	for i := 0; i < 3; i++ {
+		if strings.Contains(errStr, fmt.Sprintf("panic from collector %d", i)) {
+			panicCount++
+		}
+	}
+
+	if panicCount < 3 {
+		t.Errorf("expected errors from all 3 panicking collectors, but only found %d", panicCount)
+	}
+}
+
+func TestMustGatherSucceeds(t *testing.T) {
+	// Create a new registry without default collectors.
+	reg := prometheus.NewRegistry()
+
+	// Register a normal collector that doesn't panic.
+	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_metric",
+		Help: "Test metric",
+	}))
+
+	// MustGather should succeed without panicking.
+	mfs := reg.MustGather()
+
+	// Verify we got the expected metric.
+	if len(mfs) != 1 || mfs[0].GetName() != "test_metric" {
+		t.Errorf("unexpected gathered metrics: %v", mfs)
+	}
+}
+
+func TestMustGatherPanicsOnError(t *testing.T) {
+	// Create a new registry without default collectors.
+	reg := prometheus.NewRegistry()
+
+	// Register a collector that panics.
+	panicCollector := &customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			panic("MustGather should panic on this")
+		},
+	}
+	reg.MustRegister(panicCollector)
+
+	// MustGather should panic because Gather returns an error.
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected MustGather to panic on Gather error")
+		}
+
+		// The panic value should be the error from Gather.
+		if !strings.Contains(fmt.Sprintf("%v", r), "panic") {
+			t.Fatalf("unexpected panic value: %v", r)
+		}
+	}()
+
+	reg.MustGather()
+	t.Fatal("MustGather should have panicked but didn't")
 }

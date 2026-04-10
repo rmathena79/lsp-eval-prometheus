@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -235,6 +236,29 @@ func (errs *MultiError) Append(err error) {
 	}
 }
 
+// MultiErrorMutex is a thread-safe wrapper around MultiError for use during
+// concurrent metric gathering.
+type MultiErrorMutex struct {
+	mtx  sync.Mutex
+	errs MultiError
+}
+
+// Append appends the provided error if it is not nil, in a thread-safe manner.
+func (m *MultiErrorMutex) Append(err error) {
+	if err != nil {
+		m.mtx.Lock()
+		m.errs = append(m.errs, err)
+		m.mtx.Unlock()
+	}
+}
+
+// MaybeUnwrap returns the underlying MultiError's MaybeUnwrap result.
+func (m *MultiErrorMutex) MaybeUnwrap() error {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	return m.errs.MaybeUnwrap()
+}
+
 // MaybeUnwrap returns nil if len(errs) is 0. It returns the first and only
 // contained error as error if len(errs is 1). In all other cases, it returns
 // the MultiError directly. This is helpful for returning a MultiError in a way
@@ -423,7 +447,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		uncheckedMetricChan = make(chan Metric, capMetricChan)
 		metricHashes        = map[uint64]struct{}{}
 		wg                  sync.WaitGroup
-		errs                MultiError          // The collected errors to return in the end.
+		errs                MultiErrorMutex      // Thread-safe error accumulation for concurrent collection.
 		registeredDescIDs   map[uint64]struct{} // Only used for pedantic checks
 	)
 
@@ -453,9 +477,37 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		for {
 			select {
 			case collector := <-checkedCollectors:
-				collector.Collect(checkedMetricChan)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// Capture panic and convert to error metric.
+							err := fmt.Errorf("collector panic: %v, stack trace:\n%s", r, debug.Stack())
+							errs.Append(err)
+							// Send an invalid metric to preserve the error in gathered output.
+							checkedMetricChan <- NewInvalidMetric(
+								NewInvalidDesc(err),
+								err,
+							)
+						}
+					}()
+					collector.Collect(checkedMetricChan)
+				}()
 			case collector := <-uncheckedCollectors:
-				collector.Collect(uncheckedMetricChan)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// Capture panic and convert to error metric.
+							err := fmt.Errorf("collector panic: %v, stack trace:\n%s", r, debug.Stack())
+							errs.Append(err)
+							// Send an invalid metric to preserve the error in gathered output.
+							uncheckedMetricChan <- NewInvalidMetric(
+								NewInvalidDesc(err),
+								err,
+							)
+						}
+					}()
+					collector.Collect(uncheckedMetricChan)
+				}()
 			default:
 				return
 			}
@@ -557,6 +609,17 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		}
 	}
 	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap()
+}
+
+// MustGather calls Gather and panics if any errors are returned. This is the
+// inverse of Gather's panic recovery behavior. It is useful for code that
+// requires metric gathering to succeed, such as initialization code.
+func (r *Registry) MustGather() []*dto.MetricFamily {
+	mfs, err := r.Gather()
+	if err != nil {
+		panic(err)
+	}
+	return mfs
 }
 
 // Describe implements Collector.
