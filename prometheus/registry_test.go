@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1363,5 +1364,211 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error from Gather: %v", err)
 		}
+	}
+}
+
+// TestMustGather tests the MustGather function on successful gather.
+func TestMustGather(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_must_gather",
+		Help: "Test metric for MustGather",
+	}))
+
+	// MustGather should return metrics without panicking
+	mf := reg.MustGather()
+	if len(mf) != 1 {
+		t.Errorf("expected 1 metric family, got %d", len(mf))
+	}
+	if *mf[0].Name != "test_must_gather" {
+		t.Errorf("expected metric name 'test_must_gather', got %q", *mf[0].Name)
+	}
+}
+
+// TestMustGatherPanicsOnError tests that MustGather panics when Gather returns an error.
+func TestMustGatherPanicsOnError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	// Create a collector that returns an error
+	errCollector := prometheus.CollectorFunc(func(ch chan<- prometheus.Metric) {
+		// Send an invalid metric that will cause Gather to fail
+		ch <- prometheus.NewInvalidMetric(
+			prometheus.NewDesc("invalid_metric", "An invalid metric", nil, nil),
+			errors.New("test error"),
+		)
+	})
+	reg.MustRegister(errCollector)
+
+	// MustGather should panic on error
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected MustGather to panic on error, but it didn't")
+		}
+	}()
+	reg.MustGather()
+}
+
+// TestDefaultRegistryMustGather tests the package-level MustGather function.
+func TestDefaultRegistryMustGather(t *testing.T) {
+	// Save the original default registry
+	originalReg := prometheus.DefaultRegisterer
+	originalGatherer := prometheus.DefaultGatherer
+
+	// Create a new registry for testing
+	testReg := prometheus.NewRegistry()
+	testReg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "default_registry_test",
+		Help: "Test metric",
+	}))
+
+	// Temporarily replace the default gatherer with our test registry
+	prometheus.DefaultGatherer = testReg
+
+	defer func() {
+		prometheus.DefaultRegisterer = originalReg
+		prometheus.DefaultGatherer = originalGatherer
+	}()
+
+	// Call the package-level MustGather function
+	mf := prometheus.MustGather()
+	if len(mf) != 1 {
+		t.Errorf("expected 1 metric family, got %d", len(mf))
+	}
+}
+
+// panicCollector is a collector that panics when Collect is called.
+type panicCollector struct {
+	name string
+}
+
+func (pc *panicCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- prometheus.NewDesc("panic_metric", "Metric that will panic", nil, nil)
+}
+
+func (pc *panicCollector) Collect(ch chan<- prometheus.Metric) {
+	panic(pc.name)
+}
+
+// TestGatherHandlesPanicingCollector tests that Gather handles collector panics gracefully.
+func TestGatherHandlesPanicingCollector(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	// Register a normal collector
+	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "normal_metric",
+		Help: "A normal metric",
+	}))
+
+	// Register a panicking collector
+	reg.MustRegister(&panicCollector{name: "test panic"})
+
+	// Gather should return an error mentioning the panic instead of panicking
+	metrics, err := reg.Gather()
+	if err == nil {
+		t.Error("expected Gather to return an error due to panic, but got nil")
+	}
+
+	// Check that the error message contains panic-related information
+	if !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("expected error to contain 'panicked', got: %v", err)
+	}
+
+	// Metrics should still be collected from non-panicking collectors
+	var foundNormalMetric bool
+	for _, mf := range metrics {
+		if *mf.Name == "normal_metric" {
+			foundNormalMetric = true
+		}
+	}
+	if !foundNormalMetric {
+		t.Error("expected to collect metrics from non-panicking collector")
+	}
+}
+
+// TestGatherConcurrentErrors tests thread-safe error accumulation during concurrent gathering.
+func TestGatherConcurrentErrors(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	// Register multiple collectors that will produce errors
+	for i := 0; i < 5; i++ {
+		i := i // capture loop variable
+		reg.MustRegister(&panicCollector{name: fmt.Sprintf("panic_%d", i)})
+	}
+
+	// Gather should collect all errors in a thread-safe manner
+	metrics, err := reg.Gather()
+	if err == nil {
+		t.Error("expected Gather to return an error, but got nil")
+	}
+
+	// All panics should be represented in the error
+	errStr := err.Error()
+	panicCount := strings.Count(errStr, "panicked")
+	if panicCount != 5 {
+		t.Errorf("expected 5 panic errors, but found %d in error: %v", panicCount, err)
+	}
+}
+
+// TestGatherConcurrentWithPanics tests Gather works correctly with concurrent collectors and panics.
+func TestGatherConcurrentWithPanics(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+
+	// Create a metric with multiple label combinations
+	cv := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "test_counter",
+			Help: "Test counter",
+		},
+		[]string{"label"},
+	)
+	reg.MustRegister(cv)
+
+	// Register some panicking collectors
+	for i := 0; i < 3; i++ {
+		i := i
+		reg.MustRegister(&panicCollector{name: fmt.Sprintf("concurrent_panic_%d", i)})
+	}
+
+	// Concurrently update metrics and gather
+	quit := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Goroutine 1: Keep updating the counter
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			select {
+			case <-quit:
+				return
+			default:
+				cv.WithLabelValues(fmt.Sprintf("val_%d", i%5)).Inc()
+			}
+		}
+	}()
+
+	// Goroutine 2: Keep gathering
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			select {
+			case <-quit:
+				return
+			default:
+				_, _ = reg.Gather()
+			}
+		}
+	}()
+
+	// Let it run for a bit
+	time.Sleep(100 * time.Millisecond)
+	close(quit)
+	wg.Wait()
+
+	// Final gather should still work and report errors
+	_, err := reg.Gather()
+	if err == nil {
+		t.Error("expected Gather to return an error due to panics")
 	}
 }

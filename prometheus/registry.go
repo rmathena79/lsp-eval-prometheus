@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -184,6 +185,15 @@ func MustRegister(cs ...Collector) {
 // more details.
 func Unregister(c Collector) bool {
 	return DefaultRegisterer.Unregister(c)
+}
+
+// MustGather calls the Gather method of the DefaultGatherer and panics if any
+// errors are returned.
+//
+// MustGather is a shortcut for DefaultGatherer.MustGather(). See there for more
+// details.
+func MustGather() []*dto.MetricFamily {
+	return defaultRegistry.MustGather()
 }
 
 // GathererFunc turns a function into a Gatherer.
@@ -424,8 +434,17 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		metricHashes        = map[uint64]struct{}{}
 		wg                  sync.WaitGroup
 		errs                MultiError          // The collected errors to return in the end.
+		errsMu              sync.Mutex          // Protects errs for thread-safe accumulation.
 		registeredDescIDs   map[uint64]struct{} // Only used for pedantic checks
 	)
+
+	appendErr := func(err error) {
+		if err != nil {
+			errsMu.Lock()
+			errs = append(errs, err)
+			errsMu.Unlock()
+		}
+	}
 
 	goroutineBudget := len(r.collectorsByID) + len(r.uncheckedCollectors)
 	metricFamiliesByName := make(map[string]*dto.MetricFamily, len(r.dimHashesByName))
@@ -449,13 +468,24 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 
 	wg.Add(goroutineBudget)
 
+	safeCollect := func(collector Collector, ch chan<- Metric) {
+		defer func() {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("collector panicked: %v\n%s", r, debug.Stack())
+				appendErr(err)
+				ch <- NewInvalidMetric(NewInvalidDesc(err), err)
+			}
+		}()
+		collector.Collect(ch)
+	}
+
 	collectWorker := func() {
 		for {
 			select {
 			case collector := <-checkedCollectors:
-				collector.Collect(checkedMetricChan)
+				safeCollect(collector, checkedMetricChan)
 			case collector := <-uncheckedCollectors:
-				collector.Collect(uncheckedMetricChan)
+				safeCollect(collector, uncheckedMetricChan)
 			default:
 				return
 			}
@@ -499,7 +529,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				cmc = nil
 				break
 			}
-			errs.Append(processMetric(
+			appendErr(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				registeredDescIDs,
@@ -509,7 +539,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				umc = nil
 				break
 			}
-			errs.Append(processMetric(
+			appendErr(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				nil,
@@ -526,7 +556,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						cmc = nil
 						break
 					}
-					errs.Append(processMetric(
+					appendErr(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						registeredDescIDs,
@@ -536,7 +566,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						umc = nil
 						break
 					}
-					errs.Append(processMetric(
+					appendErr(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						nil,
@@ -557,6 +587,15 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		}
 	}
 	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap()
+}
+
+// MustGather calls Gather and panics if any errors are returned.
+func (r *Registry) MustGather() []*dto.MetricFamily {
+	metrics, err := r.Gather()
+	if err != nil {
+		panic(err)
+	}
+	return metrics
 }
 
 // Describe implements Collector.
