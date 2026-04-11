@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1363,5 +1364,112 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error from Gather: %v", err)
 		}
+	}
+}
+
+// panicCollector is a Collector whose Collect method always panics.
+type panicCollector struct {
+	desc    *prometheus.Desc
+	metrics []prometheus.Metric // emitted before the panic
+}
+
+func (p *panicCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- p.desc
+}
+
+func (p *panicCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, m := range p.metrics {
+		ch <- m
+	}
+	panic("oops from panicCollector")
+}
+
+func TestGatherRecoversPanic(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	reg := prometheus.NewRegistry()
+
+	gauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "before_panic_metric",
+		Help: "A metric emitted before the panic.",
+	})
+	gauge.Set(42)
+
+	pc := &panicCollector{
+		desc:    prometheus.NewDesc("panic_collector_metric", "a metric that panics on collect", nil, nil),
+		metrics: []prometheus.Metric{gauge},
+	}
+	reg.MustRegister(pc)
+
+	mfs, err := reg.Gather()
+
+	// Gather must return an error, not itself panic.
+	if err == nil {
+		t.Fatal("expected an error from Gather due to collector panic, got nil")
+	}
+	if !strings.Contains(err.Error(), "oops from panicCollector") {
+		t.Errorf("expected panic value in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "panic in Collect [recovered]") {
+		t.Errorf("expected recovery notice in error, got: %v", err)
+	}
+
+	// The metric emitted before the panic must be preserved.
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "before_panic_metric" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("metric emitted before panic was not preserved in gathered output")
+	}
+}
+
+func TestGatherRecoversPanicUncheckedCollector(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	reg := prometheus.NewRegistry()
+
+	// Wrap in an uncheckedCollector so it goes through the unchecked path.
+	pc := &panicCollector{
+		desc: prometheus.NewDesc("panic_unchecked_metric", "a metric that panics on collect", nil, nil),
+	}
+	reg.MustRegister(uncheckedCollector{pc})
+
+	_, err := reg.Gather()
+
+	if err == nil {
+		t.Fatal("expected an error from Gather due to unchecked collector panic, got nil")
+	}
+	if !strings.Contains(err.Error(), "oops from panicCollector") {
+		t.Errorf("expected panic value in error, got: %v", err)
+	}
+}
+
+func TestMustGatherPanicsOnError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(&panicCollector{
+		desc: prometheus.NewDesc("mustgather_panic_metric", "panics on collect", nil, nil),
+	})
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected MustGather to panic when Gather returns an error, but it did not")
+		}
+	}()
+	reg.MustGather()
+}
+
+func TestMustGatherReturnsMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: "mustgather_ok_metric", Help: "test"})
+	g.Set(7)
+	reg.MustRegister(g)
+
+	mfs := reg.MustGather()
+	if len(mfs) == 0 {
+		t.Error("expected MustGather to return metric families, got none")
 	}
 }
