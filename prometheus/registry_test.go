@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1364,4 +1365,92 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 			t.Fatalf("unexpected error from Gather: %v", err)
 		}
 	}
+}
+
+func TestGatherRecoversFromCollectorPanic(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	desc := prometheus.NewDesc("test_counter", "help", []string{"l"}, nil)
+	m := prometheus.MustNewConstMetric(desc, prometheus.CounterValue, 1, "x")
+	reg.MustRegister(&customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			ch <- m
+			panic("boom")
+		},
+	})
+
+	var (
+		mfs []*dto.MetricFamily
+		err error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Gather panicked: %v", r)
+			}
+		}()
+		mfs, err = reg.Gather()
+	}()
+
+	if err == nil {
+		t.Fatalf("expected error from Gather")
+	}
+	var perr *prometheus.CollectorPanicError
+	if !errors.As(err, &perr) {
+		t.Fatalf("expected a CollectorPanicError, got %T: %v", err, err)
+	}
+	if perr.Stack == nil || !strings.Contains(string(perr.Stack), "TestGatherRecoversFromCollectorPanic") {
+		t.Fatalf("expected stack trace to reference this test, got:\n%s", perr.Stack)
+	}
+
+	var (
+		foundTestCounter bool
+		foundPanicMetric bool
+	)
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "test_counter":
+			foundTestCounter = true
+			if len(mf.Metric) != 1 || mf.Metric[0].GetCounter().GetValue() != 1 {
+				t.Fatalf("unexpected test_counter metric: %v", mf)
+			}
+		case "prometheus_registry_collector_panic":
+			foundPanicMetric = true
+			if len(mf.Metric) != 1 || mf.Metric[0].GetGauge().GetValue() != 1 {
+				t.Fatalf("unexpected panic metric: %v", mf)
+			}
+			var stack string
+			for _, lp := range mf.Metric[0].Label {
+				if lp.GetName() == "stacktrace" {
+					stack = lp.GetValue()
+					break
+				}
+			}
+			if !strings.Contains(stack, "TestGatherRecoversFromCollectorPanic") {
+				t.Fatalf("expected panic metric stacktrace label to reference this test, got:\n%s", stack)
+			}
+		}
+	}
+	if !foundTestCounter {
+		t.Fatalf("expected gathered output to preserve metrics emitted before panic")
+	}
+	if !foundPanicMetric {
+		t.Fatalf("expected gathered output to include recovered panic metric")
+	}
+}
+
+func TestMustGatherPanicsOnError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(&customCollector{
+		collectFunc: func(_ chan<- prometheus.Metric) {
+			panic("boom")
+		},
+	})
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected MustGather to panic")
+		}
+	}()
+	_ = reg.MustGather()
 }

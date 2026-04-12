@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -194,6 +195,16 @@ func (gf GathererFunc) Gather() ([]*dto.MetricFamily, error) {
 	return gf()
 }
 
+// MustGather calls Gather on the DefaultGatherer and panics if any error is
+// returned.
+func MustGather() []*dto.MetricFamily {
+	mfs, err := DefaultGatherer.Gather()
+	if err != nil {
+		panic(err)
+	}
+	return mfs
+}
+
 // AlreadyRegisteredError is returned by the Register method if the Collector to
 // be registered has already been registered before, or a different Collector
 // that collects the same metrics has been registered before. Registration fails
@@ -248,6 +259,34 @@ func (errs MultiError) MaybeUnwrap() error {
 	default:
 		return errs
 	}
+}
+
+// CollectorPanicError is returned (wrapped) by Gather when a registered
+// Collector panics during Collect. It captures the recovered panic value and a
+// stack trace to aid debugging.
+type CollectorPanicError struct {
+	Collector string
+	Value     interface{}
+	Stack     []byte
+}
+
+func (e *CollectorPanicError) Error() string {
+	// Keep a stable, multi-line format since stack traces are inherently multi-line.
+	return fmt.Sprintf("collector %s panicked: %v\nstack trace:\n%s", e.Collector, e.Value, e.Stack)
+}
+
+var collectorPanicDesc = NewDesc(
+	"prometheus_registry_collector_panic",
+	"A Prometheus collector panic was recovered by the Prometheus registry.",
+	[]string{"collector", "panic", "stacktrace"},
+	nil,
+)
+
+func collectorString(c Collector) string {
+	if c == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%T", c)
 }
 
 // Registry registers Prometheus collectors, collects their metrics, and gathers
@@ -408,6 +447,15 @@ func (r *Registry) MustRegister(cs ...Collector) {
 	}
 }
 
+// MustGather calls Gather and panics if any error is returned.
+func (r *Registry) MustGather() []*dto.MetricFamily {
+	mfs, err := r.Gather()
+	if err != nil {
+		panic(err)
+	}
+	return mfs
+}
+
 // Gather implements Gatherer.
 func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 	r.mtx.RLock()
@@ -424,6 +472,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		metricHashes        = map[uint64]struct{}{}
 		wg                  sync.WaitGroup
 		errs                MultiError          // The collected errors to return in the end.
+		errsMtx             sync.Mutex          // Protects errs from concurrent use.
 		registeredDescIDs   map[uint64]struct{} // Only used for pedantic checks
 	)
 
@@ -449,17 +498,74 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 
 	wg.Add(goroutineBudget)
 
+	appendErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errsMtx.Lock()
+		defer errsMtx.Unlock()
+		errs.Append(err)
+	}
+
+	emitPanic := func(collector Collector, recovered interface{}) {
+		stack := debug.Stack()
+		collectorID := collectorString(collector)
+		cerr := &CollectorPanicError{
+			Collector: collectorID,
+			Value:     recovered,
+			Stack:     stack,
+		}
+
+		// Surface the panic as an error (via an InvalidMetric) and also as a
+		// gathered metric so callers can inspect it even when continuing on
+		// errors.
+		uncheckedMetricChan <- NewInvalidMetric(collectorPanicDesc, cerr)
+		if m, err := NewConstMetric(
+			collectorPanicDesc,
+			GaugeValue,
+			1,
+			collectorID,
+			fmt.Sprint(recovered),
+			string(stack),
+		); err == nil {
+			uncheckedMetricChan <- m
+		} else {
+			// This should never happen, but don't allow a secondary panic while
+			// handling the original one.
+			appendErr(fmt.Errorf("failed to create collector panic metric: %w", err))
+		}
+	}
+
 	collectWorker := func() {
 		for {
+			var (
+				collector Collector
+				ch        chan Metric
+				ok        bool
+			)
 			select {
-			case collector := <-checkedCollectors:
-				collector.Collect(checkedMetricChan)
-			case collector := <-uncheckedCollectors:
-				collector.Collect(uncheckedMetricChan)
+			case collector, ok = <-checkedCollectors:
+				if !ok {
+					return
+				}
+				ch = checkedMetricChan
+			case collector, ok = <-uncheckedCollectors:
+				if !ok {
+					return
+				}
+				ch = uncheckedMetricChan
 			default:
 				return
 			}
-			wg.Done()
+			func() {
+				defer wg.Done()
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						emitPanic(collector, recovered)
+					}
+				}()
+				collector.Collect(ch)
+			}()
 		}
 	}
 
@@ -499,7 +605,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				cmc = nil
 				break
 			}
-			errs.Append(processMetric(
+			appendErr(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				registeredDescIDs,
@@ -509,7 +615,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				umc = nil
 				break
 			}
-			errs.Append(processMetric(
+			appendErr(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				nil,
@@ -526,7 +632,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						cmc = nil
 						break
 					}
-					errs.Append(processMetric(
+					appendErr(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						registeredDescIDs,
@@ -536,7 +642,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						umc = nil
 						break
 					}
-					errs.Append(processMetric(
+					appendErr(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						nil,
@@ -556,7 +662,11 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 			break
 		}
 	}
-	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap()
+	mfs := internal.NormalizeMetricFamilies(metricFamiliesByName)
+	errsMtx.Lock()
+	err := errs.MaybeUnwrap()
+	errsMtx.Unlock()
+	return mfs, err
 }
 
 // Describe implements Collector.
