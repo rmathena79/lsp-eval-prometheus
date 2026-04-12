@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1304,6 +1305,68 @@ func (co *customCollector) Describe(_ chan<- *prometheus.Desc) {}
 
 func (co *customCollector) Collect(ch chan<- prometheus.Metric) {
 	co.collectFunc(ch)
+}
+
+type panicCollector struct {
+	metric     prometheus.Metric
+	panicValue any
+}
+
+func (p *panicCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- p.metric.Desc()
+}
+
+func (p *panicCollector) Collect(ch chan<- prometheus.Metric) {
+	ch <- p.metric
+	panic(p.panicValue)
+}
+
+func TestGatherRecoversFromCollectorPanic(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	desc := prometheus.NewDesc("panic_metric_total", "help", nil, nil)
+	reg.MustRegister(&panicCollector{
+		metric:     prometheus.MustNewConstMetric(desc, prometheus.CounterValue, 1),
+		panicValue: "boom",
+	})
+
+	mfs, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected gather error")
+	}
+	if !strings.Contains(err.Error(), "collector panic: boom") {
+		t.Fatalf("expected panic message in error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "goroutine ") {
+		t.Fatalf("expected stack trace in error, got %v", err)
+	}
+	if len(mfs) != 1 {
+		t.Fatalf("expected 1 metric family, got %d", len(mfs))
+	}
+	if got := mfs[0].GetName(); got != "panic_metric_total" {
+		t.Fatalf("expected metric family panic_metric_total, got %q", got)
+	}
+	if len(mfs[0].Metric) != 1 {
+		t.Fatalf("expected 1 preserved metric, got %d", len(mfs[0].Metric))
+	}
+	if got := mfs[0].Metric[0].GetCounter().GetValue(); got != 1 {
+		t.Fatalf("expected preserved counter value 1, got %v", got)
+	}
+}
+
+func TestMustGatherPanicsOnError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	desc := prometheus.NewDesc("panic_metric_total", "help", nil, nil)
+	reg.MustRegister(&panicCollector{
+		metric:     prometheus.MustNewConstMetric(desc, prometheus.CounterValue, 1),
+		panicValue: "boom",
+	})
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected MustGather to panic")
+		}
+	}()
+	prometheus.MustGather(reg)
 }
 
 // TestCheckMetricConsistency
