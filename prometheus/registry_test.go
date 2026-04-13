@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1364,4 +1365,118 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 			t.Fatalf("unexpected error from Gather: %v", err)
 		}
 	}
+}
+
+func TestGatherRecoversFromCollectorPanicAndPreservesMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	descA := prometheus.NewDesc("test_before_panic_a", "help", nil, nil)
+	descB := prometheus.NewDesc("test_before_panic_b", "help", nil, nil)
+	metricA := prometheus.MustNewConstMetric(descA, prometheus.GaugeValue, 1)
+	metricB := prometheus.MustNewConstMetric(descB, prometheus.GaugeValue, 2)
+
+	panicCollector := &customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			ch <- metricA
+			ch <- metricB
+			panic("boom")
+		},
+	}
+	reg.MustRegister(panicCollector)
+
+	mfs, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected error from Gather when a collector panics")
+	}
+	if !strings.Contains(err.Error(), "panic in collector") || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected panic error to include collector panic info, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "goroutine") {
+		t.Fatalf("expected panic error to include stack trace, got: %v", err)
+	}
+
+	var (
+		gotA, gotB, gotPanicMarker bool
+		panicMarkerMetric          *dto.Metric
+	)
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "test_before_panic_a":
+			gotA = true
+		case "test_before_panic_b":
+			gotB = true
+		case "prometheus_registry_collector_panic":
+			gotPanicMarker = true
+			if len(mf.Metric) > 0 {
+				panicMarkerMetric = mf.Metric[0]
+			}
+		}
+	}
+
+	if !gotA || !gotB {
+		t.Fatalf("expected metrics emitted before the panic to be preserved, gotA=%v gotB=%v", gotA, gotB)
+	}
+	if !gotPanicMarker || panicMarkerMetric == nil {
+		t.Fatalf("expected Gather to include collector panic marker metric family with a metric, gotPanicMarker=%v", gotPanicMarker)
+	}
+
+	var (
+		collectorLabel string
+		panicLabel     string
+		seqLabel       string
+	)
+	for _, lp := range panicMarkerMetric.Label {
+		switch lp.GetName() {
+		case "collector":
+			collectorLabel = lp.GetValue()
+		case "panic":
+			panicLabel = lp.GetValue()
+		case "seq":
+			seqLabel = lp.GetValue()
+		}
+	}
+	if collectorLabel == "" || !strings.Contains(collectorLabel, "customCollector") {
+		t.Fatalf("expected panic marker to include collector label mentioning the collector type, got %q", collectorLabel)
+	}
+	if panicLabel != "boom" {
+		t.Fatalf("expected panic marker to include panic label %q, got %q", "boom", panicLabel)
+	}
+	if seqLabel == "" {
+		t.Fatalf("expected panic marker to include seq label, got empty")
+	}
+	if _, err := strconv.ParseUint(seqLabel, 10, 64); err != nil {
+		t.Fatalf("expected panic marker seq label to be a uint, got %q: %v", seqLabel, err)
+	}
+}
+
+func TestMustGatherPanicsOnGatherErrors(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	orig := prometheus.DefaultGatherer
+	prometheus.DefaultGatherer = reg
+	defer func() { prometheus.DefaultGatherer = orig }()
+
+	desc := prometheus.NewDesc("test_ok", "help", nil, nil)
+	okMetric := prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, 1)
+	okCollector := &customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			ch <- okMetric
+		},
+	}
+	reg.MustRegister(okCollector)
+	_ = prometheus.MustGather()
+
+	panicCollector := &customCollector{
+		collectFunc: func(ch chan<- prometheus.Metric) {
+			panic("boom")
+		},
+	}
+	reg.MustRegister(panicCollector)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected MustGather to panic when Gather returns an error")
+		}
+	}()
+	_ = prometheus.MustGather()
 }
