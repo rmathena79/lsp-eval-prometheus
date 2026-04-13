@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1364,4 +1365,86 @@ func TestGatherDoesNotLeakGoroutines(t *testing.T) {
 			t.Fatalf("unexpected error from Gather: %v", err)
 		}
 	}
+}
+
+type panicCollector struct {
+	desc   *prometheus.Desc
+	metric prometheus.Metric
+	panicV any
+}
+
+func (c panicCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+func (c panicCollector) Collect(ch chan<- prometheus.Metric) {
+	if c.metric != nil {
+		ch <- c.metric
+	}
+	panic(c.panicV)
+}
+
+func TestGatherRecoversCollectorPanic(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	desc := prometheus.NewDesc("panic_metric", "help", nil, nil)
+	metric := prometheus.MustNewConstMetric(desc, prometheus.CounterValue, 7)
+	reg.MustRegister(panicCollector{
+		desc:   desc,
+		metric: metric,
+		panicV: "collector boom",
+	})
+
+	mfs, err := reg.Gather()
+	if err == nil {
+		t.Fatal("expected gather to return an error")
+	}
+	if got := err.Error(); !strings.Contains(got, "panic in collector") || !strings.Contains(got, "collector boom") || !strings.Contains(got, "goroutine") {
+		t.Fatalf("unexpected panic error: %q", got)
+	}
+
+	var gotPanicFamily, gotMetricFamily *dto.MetricFamily
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "panic_metric":
+			gotMetricFamily = mf
+		case "prometheus_gather_panic":
+			gotPanicFamily = mf
+		}
+	}
+	if gotMetricFamily == nil {
+		t.Fatal("expected metric collected before panic to be preserved")
+	}
+	if len(gotMetricFamily.Metric) != 1 {
+		t.Fatalf("expected one preserved metric, got %d", len(gotMetricFamily.Metric))
+	}
+	if gotPanicFamily == nil {
+		t.Fatal("expected panic metric family to be emitted")
+	}
+	if len(gotPanicFamily.Metric) != 1 {
+		t.Fatalf("expected one panic metric, got %d", len(gotPanicFamily.Metric))
+	}
+	if got := gotPanicFamily.Metric[0].GetLabel(); len(got) == 0 {
+		t.Fatal("expected panic metric to carry details")
+	}
+}
+
+func TestMustGatherPanicsOnCollectorPanic(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	desc := prometheus.NewDesc("panic_metric", "help", nil, nil)
+	reg.MustRegister(panicCollector{
+		desc:   desc,
+		metric: prometheus.MustNewConstMetric(desc, prometheus.CounterValue, 7),
+		panicV: "collector boom",
+	})
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected MustGather to panic")
+		}
+		if got := fmt.Sprint(r); !strings.Contains(got, "panic in collector") || !strings.Contains(got, "collector boom") {
+			t.Fatalf("unexpected panic value: %q", got)
+		}
+	}()
+	prometheus.MustGather(reg)
 }
