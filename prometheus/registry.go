@@ -186,6 +186,16 @@ func Unregister(c Collector) bool {
 	return DefaultRegisterer.Unregister(c)
 }
 
+// MustGather calls the provided Gatherer's Gather method and panics if any
+// error is returned. This is analogous to MustRegister but for gathering.
+func MustGather(g Gatherer) []*dto.MetricFamily {
+	mfs, err := g.Gather()
+	if err != nil {
+		panic(err)
+	}
+	return mfs
+}
+
 // GathererFunc turns a function into a Gatherer.
 type GathererFunc func() ([]*dto.MetricFamily, error)
 
@@ -447,15 +457,34 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 	}
 	r.mtx.RUnlock()
 
+	var errsMtx sync.Mutex // Protects errs for concurrent access from worker goroutines.
+
 	wg.Add(goroutineBudget)
+
+	safeCollect := func(collector Collector, ch chan<- Metric) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				stackTrace := string(buf[:n])
+				panicErr := fmt.Errorf("panic in collector Collect: %v\n\n%s", rec, stackTrace)
+				errsMtx.Lock()
+				errs.Append(panicErr)
+				errsMtx.Unlock()
+				// Emit an InvalidMetric so callers can inspect the error.
+				ch <- NewInvalidMetric(NewDesc("__collector_panic", "Collector panicked during Collect", nil, nil), panicErr)
+			}
+		}()
+		collector.Collect(ch)
+	}
 
 	collectWorker := func() {
 		for {
 			select {
 			case collector := <-checkedCollectors:
-				collector.Collect(checkedMetricChan)
+				safeCollect(collector, checkedMetricChan)
 			case collector := <-uncheckedCollectors:
-				collector.Collect(uncheckedMetricChan)
+				safeCollect(collector, uncheckedMetricChan)
 			default:
 				return
 			}
@@ -492,6 +521,12 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 	cmc := checkedMetricChan
 	umc := uncheckedMetricChan
 
+	appendErr := func(err error) {
+		errsMtx.Lock()
+		errs.Append(err)
+		errsMtx.Unlock()
+	}
+
 	for {
 		select {
 		case metric, ok := <-cmc:
@@ -499,7 +534,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				cmc = nil
 				break
 			}
-			errs.Append(processMetric(
+			appendErr(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				registeredDescIDs,
@@ -509,7 +544,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				umc = nil
 				break
 			}
-			errs.Append(processMetric(
+			appendErr(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
 				nil,
@@ -526,7 +561,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						cmc = nil
 						break
 					}
-					errs.Append(processMetric(
+					appendErr(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						registeredDescIDs,
@@ -536,7 +571,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						umc = nil
 						break
 					}
-					errs.Append(processMetric(
+					appendErr(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
 						nil,
