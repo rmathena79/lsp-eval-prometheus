@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(go test:*)",
+      "Bash(mkdir -p /c/source_gh/lsp-eval-prometheus/api/prometheus/v1/internal/codec)",
+      "Bash(mkdir -p /c/source_gh/lsp-eval-prometheus/api/prometheus/v1/internal/transport)",
+      "Bash(mkdir -p /c/source_gh/lsp-eval-prometheus/api/prometheus/v1/internal/endpoints)",
+      "Bash(go build:*)",
+      "Bash(go doc:*)"
+    ]
+  }
+}
